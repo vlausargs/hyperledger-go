@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# "IBM Corp." Confidential
+#
+# OCO Source Materials
+#
+# 5737-IBM
+#
+# (C) Copyright IBM Corp. 2018, 2020
+#
+# The source code for this program is not published or otherwise
+# divested of its trade secrets, irrespective of what has been
+# deposited with the U.S. Copyright Office.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# This is a configuration file for the cryptogen tool.
+#
+# The "orgs" section contains configuration for each organization.
+# It contains a "count" key which specifies the number of peers per org,
+# and a "domain" key which specifies the domain for the org.
+# The "users" key under each org is used to configure the number of user
+# certificates that will be generated for each org. The "count" key can be
+# omitted if no user certificates need to be generated.
+#
+# Sample "cryptogen" configuration file
+# ---------------------------------------------------------------------------
+
+OrdererOrgs:
+  # ---------------------------------------------------------------------------
+  # OrdererOrg defines the organization which runs the orderer nodes.
+  # ---------------------------------------------------------------------------
+  - Name: Orderer
+    Domain: example.com
+    EnableNodeOUs: true
+    Specs:
+      - Hostname: orderer
+        SANS:
+          - 127.0.0.1
+
+PeerOrgs:
+  # ---------------------------------------------------------------------------
+  # PeerOrg1 represents the first peer organization.
+  # ---------------------------------------------------------------------------
+  - Name: Org1
+    Domain: org1.example.com
+    EnableNodeOUs: true
+    Template:
+      Count: 2
+      SANS:
+        - 127.0.0.1
+    Users:
+      Count: 1
+
+  # ---------------------------------------------------------------------------
+  # PeerOrg2 represents the second peer organization.
+  # ---------------------------------------------------------------------------
+  - Name: Org2
+    Domain: org2.example.com
+    EnableNodeOUs: true
+    Template:
+      Count: 2
+      SANS:
+        - 127.0.0.1
+    Users:
+      Count: 1
