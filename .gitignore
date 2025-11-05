@@ -4,6 +4,14 @@
 **/vendor/
 vendor/
 
+# Test working directories
+test-network-working/
+**/test-network-working/
+
+# Generated chaincode packages
+**/*.tar.gz
+scripts/*.tar.gz
+
 
 # Fabric generated files and certificates
 fabric-samples/test-network/organizations/
@@ -103,3 +111,12 @@ coverage.html
 
 # Temporary certificates for testing
 **/crypto-config/
+
+# API build artifacts
+api/api
+api/api.pid
+api/*.log
+
+# Network generated files
+**/channel-artifacts/
+**/organizations/

@@ -1,4 +1,5 @@
 {
-    "type": "ccaas",
-    "label": "fabcar"
+  "path": "hyperledger-go/chaincode",
+  "type": "golang",
+  "label": "custom-chaincode_1.0"
 }
