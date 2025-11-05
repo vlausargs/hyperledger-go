@@ -1,15 +1,20 @@
 package main
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
-	"strings"
+	"path"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hyperledger/fabric-gateway/pkg/client"
+	"github.com/hyperledger/fabric-gateway/pkg/identity"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // Asset represents structure of an asset
@@ -19,6 +24,8 @@ type Asset struct {
 	Size           int    `json:"size"`
 	Owner          string `json:"owner"`
 	AppraisedValue int    `json:"appraisedValue"`
+	CreatedAt      string `json:"createdAt,omitempty"`
+	UpdatedAt      string `json:"updatedAt,omitempty"`
 }
 
 // CreateAssetRequest represents the request to create an asset
@@ -43,58 +50,174 @@ type TransferAssetRequest struct {
 	NewOwner string `json:"newOwner" binding:"required"`
 }
 
-// executeChaincode executes a chaincode command using docker exec
-func executeChaincode(command string, args ...string) (string, error) {
-	// Build peer chaincode command with all arguments
-	chaincodeArgs := []string{"chaincode", command}
-	chaincodeArgs = append(chaincodeArgs, args...)
+// AssetHistory represents the history of an asset
+type AssetHistory struct {
+	AssetID   string `json:"assetId"`
+	Action    string `json:"action"`
+	Owner     string `json:"owner"`
+	TxID      string `json:"txId"`
+	Timestamp string `json:"timestamp"`
+}
 
-	// Build full docker exec command
-	bashScript := "export CORE_PEER_TLS_ENABLED=true && " +
-		"export CORE_PEER_LOCALMSPID=Org1MSP && " +
-		"export CORE_PEER_TLS_ROOTCERT_FILE=/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem && " +
-		"export CORE_PEER_MSPCONFIGPATH=/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp && " +
-		"export CORE_PEER_ADDRESS=peer0.org1.example.com:7051 && " +
-		"peer " + strings.Join(chaincodeArgs, " ")
+// OrgSetup contains organization's config to interact with the network
+type OrgSetup struct {
+	OrgName      string
+	MSPID        string
+	CertPath     string
+	KeyPath      string
+	TLSCertPath  string
+	PeerEndpoint string
+	GatewayPeer  string
+	Gateway      client.Gateway
+}
 
-	allArgs := []string{"exec", "cli", "bash", "-c", bashScript}
+var (
+	orgSetup OrgSetup
+)
 
-	cmd := exec.Command("docker", allArgs...)
+// initializeGateway initializes the Fabric Gateway connection
+func initializeGateway() error {
+	// Set up the organization configuration based on test-network structure
+	cryptoPath := "/home/myindo/workspace/myindo/hyperledger-go/fabric-samples/test-network/organizations/peerOrganizations/org1.example.com"
 
-	output, err := cmd.CombinedOutput()
+	orgSetup = OrgSetup{
+		OrgName:      "Org1",
+		MSPID:        "Org1MSP",
+		CertPath:     cryptoPath + "/users/Admin@org1.example.com/msp/signcerts/Admin@org1.example.com-cert.pem",
+		KeyPath:      cryptoPath + "/users/Admin@org1.example.com/msp/keystore/",
+		TLSCertPath:  cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt",
+		PeerEndpoint: "localhost:7051",
+		GatewayPeer:  "peer0.org1.example.com",
+	}
+
+	log.Printf("Initializing connection for %s...", orgSetup.OrgName)
+
+	clientConnection := orgSetup.newGrpcConnection()
+	id := orgSetup.newIdentity()
+	sign := orgSetup.newSign()
+
+	gateway, err := client.Connect(
+		id,
+		client.WithSign(sign),
+		client.WithClientConnection(clientConnection),
+		// Default timeouts are sufficient for most operations
+	)
 	if err != nil {
-		return "", fmt.Errorf("command failed: %s, output: %s", err.Error(), string(output))
+		return fmt.Errorf("failed to connect to gateway: %v", err)
+	}
+	orgSetup.Gateway = *gateway
+
+	log.Println("Gateway initialization complete")
+	return nil
+}
+
+// newGrpcConnection creates a gRPC connection to the Gateway server
+func (setup OrgSetup) newGrpcConnection() *grpc.ClientConn {
+	certificate, err := loadCertificate(setup.TLSCertPath)
+	if err != nil {
+		log.Panicf("failed to load TLS certificate: %v", err)
 	}
 
-	// Extract JSON from output if it exists
-	outputStr := string(output)
-	if strings.Contains(outputStr, "{") {
-		start := strings.Index(outputStr, "{")
-		end := strings.LastIndex(outputStr, "}")
-		if start != -1 && end != -1 && end > start {
-			return outputStr[start : end+1], nil
-		}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(certificate)
+	transportCredentials := credentials.NewClientTLSFromCert(certPool, setup.GatewayPeer)
+
+	connection, err := grpc.Dial(setup.PeerEndpoint, grpc.WithTransportCredentials(transportCredentials))
+	if err != nil {
+		log.Panicf("failed to create gRPC connection: %v", err)
 	}
 
-	return outputStr, nil
+	return connection
+}
+
+// newIdentity creates a client identity for this Gateway connection using an X.509 certificate
+func (setup OrgSetup) newIdentity() *identity.X509Identity {
+	certificate, err := loadCertificate(setup.CertPath)
+	if err != nil {
+		log.Panicf("failed to load certificate: %v", err)
+	}
+
+	id, err := identity.NewX509Identity(setup.MSPID, certificate)
+	if err != nil {
+		log.Panicf("failed to create identity: %v", err)
+	}
+
+	return id
+}
+
+// newSign creates a function that generates a digital signature from a message digest using a private key
+func (setup OrgSetup) newSign() identity.Sign {
+	files, err := ioutil.ReadDir(setup.KeyPath)
+	if err != nil {
+		log.Panicf("failed to read private key directory: %v", err)
+	}
+
+	privateKeyPEM, err := ioutil.ReadFile(path.Join(setup.KeyPath, files[0].Name()))
+	if err != nil {
+		log.Panicf("failed to read private key file: %v", err)
+	}
+
+	privateKey, err := identity.PrivateKeyFromPEM(privateKeyPEM)
+	if err != nil {
+		log.Panicf("failed to parse private key: %v", err)
+	}
+
+	sign, err := identity.NewPrivateKeySign(privateKey)
+	if err != nil {
+		log.Panicf("failed to create sign function: %v", err)
+	}
+
+	return sign
+}
+
+func loadCertificate(filename string) (*x509.Certificate, error) {
+	certificatePEM, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+	}
+	return identity.CertificateFromPEM(certificatePEM)
+}
+
+// evaluateTransaction evaluates a transaction (query)
+func evaluateTransaction(function string, args ...string) ([]byte, error) {
+	network := orgSetup.Gateway.GetNetwork("mychannel")
+	contract := network.GetContract("custom-chaincode")
+
+	return contract.EvaluateTransaction(function, args...)
+}
+
+// submitTransaction submits a transaction (invoke)
+func submitTransaction(function string, args ...string) ([]byte, error) {
+	network := orgSetup.Gateway.GetNetwork("mychannel")
+	contract := network.GetContract("custom-chaincode")
+
+	txn_proposal, err := contract.NewProposal(function, client.WithArguments(args...))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create transaction proposal: %v", err)
+	}
+
+	txn_endorsed, err := txn_proposal.Endorse()
+	if err != nil {
+		return nil, fmt.Errorf("failed to endorse transaction: %v", err)
+	}
+
+	_, err = txn_endorsed.Submit()
+	if err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	result := txn_endorsed.Result()
+	return result, nil
 }
 
 // initLedger initializes ledger with sample data
 func initLedger(c *gin.Context) {
-	output, err := executeChaincode("invoke", "-o", "orderer.example.com:7050",
-		"--ordererTLSHostnameOverride", "orderer.example.com",
-		"--tls", "--cafile", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/example.com/tlsca/tlsca.example.com-cert.pem",
-		"-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"",
-		"--peerAddresses", "peer0.org1.example.com:7051",
-		"--tlsRootCertFiles", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem",
-		"--peerAddresses", "peer0.org2.example.com:9051",
-		"--tlsRootCertFiles", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org2.example.com/tlsca/tlsca.org2.example.com-cert.pem")
-
+	_, err := submitTransaction("InitLedger")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Ledger initialized successfully", "output": output})
+	c.JSON(http.StatusOK, gin.H{"message": "Ledger initialized successfully"})
 }
 
 // createAsset creates a new asset
@@ -105,36 +228,25 @@ func createAsset(c *gin.Context) {
 		return
 	}
 
-	args := fmt.Sprintf(`{"Args":["CreateAsset","%s","%s","%d","%s","%d"]}`,
-		req.ID, req.Color, req.Size, req.Owner, req.AppraisedValue)
-
-	output, err := executeChaincode("invoke", "-o", "orderer.example.com:7050",
-		"--ordererTLSHostnameOverride", "orderer.example.com",
-		"--tls", "--cafile", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/example.com/tlsca/tlsca.example.com-cert.pem",
-		"-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"",
-		"--peerAddresses", "peer0.org1.example.com:7051",
-		"--tlsRootCertFiles", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem")
-
+	_, err := submitTransaction("CreateAsset", req.ID, req.Color, fmt.Sprintf("%d", req.Size), req.Owner, fmt.Sprintf("%d", req.AppraisedValue))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Asset created successfully", "id": req.ID, "output": output})
+	c.JSON(http.StatusOK, gin.H{"message": "Asset created successfully", "id": req.ID})
 }
 
 // readAsset reads an asset by ID
 func readAsset(c *gin.Context) {
 	id := c.Param("id")
-	args := fmt.Sprintf(`{"Args":["ReadAsset","%s"]}`, id)
-	output, err := executeChaincode("query", "-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"")
-
+	output, err := evaluateTransaction("ReadAsset", id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	var asset Asset
-	err = json.Unmarshal([]byte(output), &asset)
+	err = json.Unmarshal(output, &asset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -152,39 +264,23 @@ func updateAsset(c *gin.Context) {
 		return
 	}
 
-	args := fmt.Sprintf(`{"Args":["UpdateAsset","%s","%s","%d","%s","%d"]}`,
-		id, req.Color, req.Size, req.Owner, req.AppraisedValue)
-
-	output, err := executeChaincode("invoke", "-o", "orderer.example.com:7050",
-		"--ordererTLSHostnameOverride", "orderer.example.com",
-		"--tls", "--cafile", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/example.com/tlsca/tlsca.example.com-cert.pem",
-		"-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"",
-		"--peerAddresses", "peer0.org1.example.com:7051",
-		"--tlsRootCertFiles", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem")
-
+	_, err := submitTransaction("UpdateAsset", id, req.Color, fmt.Sprintf("%d", req.Size), req.Owner, fmt.Sprintf("%d", req.AppraisedValue))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Asset updated successfully", "output": output})
+	c.JSON(http.StatusOK, gin.H{"message": "Asset updated successfully"})
 }
 
 // deleteAsset deletes an asset by ID
 func deleteAsset(c *gin.Context) {
 	id := c.Param("id")
-	args := fmt.Sprintf(`{"Args":["DeleteAsset","%s"]}`, id)
-	output, err := executeChaincode("invoke", "-o", "orderer.example.com:7050",
-		"--ordererTLSHostnameOverride", "orderer.example.com",
-		"--tls", "--cafile", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/example.com/tlsca/tlsca.example.com-cert.pem",
-		"-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"",
-		"--peerAddresses", "peer0.org1.example.com:7051",
-		"--tlsRootCertFiles", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem")
-
+	_, err := submitTransaction("DeleteAsset", id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Asset deleted successfully", "output": output})
+	c.JSON(http.StatusOK, gin.H{"message": "Asset deleted successfully"})
 }
 
 // transferAsset transfers an asset to a new owner
@@ -196,33 +292,24 @@ func transferAsset(c *gin.Context) {
 		return
 	}
 
-	args := fmt.Sprintf(`{"Args":["TransferAsset","%s","%s"]}`, id, req.NewOwner)
-	output, err := executeChaincode("invoke", "-o", "orderer.example.com:7050",
-		"--ordererTLSHostnameOverride", "orderer.example.com",
-		"--tls", "--cafile", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/example.com/tlsca/tlsca.example.com-cert.pem",
-		"-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"",
-		"--peerAddresses", "peer0.org1.example.com:7051",
-		"--tlsRootCertFiles", "/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem")
-
+	_, err := submitTransaction("TransferAsset", id, req.NewOwner)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Asset transferred successfully", "output": output})
+	c.JSON(http.StatusOK, gin.H{"message": "Asset transferred successfully"})
 }
 
 // getAllAssets retrieves all assets
 func getAllAssets(c *gin.Context) {
-	args := `{"Args":["GetAllAssets"]}`
-	output, err := executeChaincode("query", "-C", "mychannel", "-n", "basic", "-c", "\""+args+"\"")
-
+	output, err := evaluateTransaction("GetAllAssets")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	var assets []Asset
-	err = json.Unmarshal([]byte(output), &assets)
+	err = json.Unmarshal(output, &assets)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -231,13 +318,69 @@ func getAllAssets(c *gin.Context) {
 	c.JSON(http.StatusOK, assets)
 }
 
-func main() {
-	// Check if CLI container is running
-	cmd := exec.Command("docker", "ps", "--filter", "name=cli", "--format", "{{.Names}}")
-	output, err := cmd.Output()
-	if err != nil || strings.TrimSpace(string(output)) != "cli" {
-		log.Fatal("CLI container is not running. Please start the Fabric network first.")
+// getAssetsByOwner retrieves assets by owner
+func getAssetsByOwner(c *gin.Context) {
+	owner := c.Param("owner")
+	output, err := evaluateTransaction("GetAssetsByOwner", owner)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
+
+	var assets []Asset
+	err = json.Unmarshal(output, &assets)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, assets)
+}
+
+// getAssetHistory retrieves the history of an asset
+func getAssetHistory(c *gin.Context) {
+	assetID := c.Param("id")
+	output, err := evaluateTransaction("GetAssetHistory", assetID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var history []AssetHistory
+	err = json.Unmarshal(output, &history)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, history)
+}
+
+// getAssetCount retrieves the total count of assets
+func getAssetCount(c *gin.Context) {
+	output, err := evaluateTransaction("GetAssetCount")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var count int
+	err = json.Unmarshal(output, &count)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"count": count})
+}
+
+func main() {
+	// Initialize Fabric Gateway
+	err := initializeGateway()
+	if err != nil {
+		log.Fatalf("Failed to initialize Fabric Gateway: %v", err)
+	}
+	defer orgSetup.Gateway.Close()
 
 	// Initialize Gin router
 	r := gin.Default()
@@ -265,10 +408,15 @@ func main() {
 		// Asset operations
 		api.POST("/assets", createAsset)
 		api.GET("/assets", getAllAssets)
+		api.GET("/assets/count", getAssetCount)
 		api.GET("/assets/:id", readAsset)
+		api.GET("/assets/:id/history", getAssetHistory)
 		api.PUT("/assets/:id", updateAsset)
 		api.DELETE("/assets/:id", deleteAsset)
 		api.POST("/assets/:id/transfer", transferAsset)
+
+		// Owner-specific operations
+		api.GET("/owners/:owner/assets", getAssetsByOwner)
 	}
 
 	// Health check
@@ -276,6 +424,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "healthy",
 			"service": "fabric-api",
+			"sdk":     "fabric-gateway",
 		})
 	})
 
@@ -285,6 +434,6 @@ func main() {
 		port = "8080"
 	}
 	port = ":" + port
-	log.Printf("Starting server on port %s", port)
+	log.Printf("Starting Fabric Gateway-based API server on port %s", port)
 	log.Fatal(r.Run(port))
 }
