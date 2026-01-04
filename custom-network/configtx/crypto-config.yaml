@@ -1,0 +1,63 @@
+# Copyright IBM Corp. All Rights Reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+---
+# ---------------------------------------------------------------------------
+# "OrdererOrgs" - Definition of organizations managing orderer nodes
+# ---------------------------------------------------------------------------
+OrdererOrgs:
+  # ---------------------------------------------------------------------------
+  # Orderer
+  # ---------------------------------------------------------------------------
+  - Name: Orderer
+    Domain: myindo.com
+    EnableNodeOUs: true
+    # ---------------------------------------------------------------------------
+    # "Specs" - See PeerOrgs below for complete description
+    # ---------------------------------------------------------------------------
+    Specs:
+      - Hostname: orderer
+        # CommonName: orderer.example.com (Optional, defaults to Hostname.Domain)
+
+# ---------------------------------------------------------------------------
+# "PeerOrgs" - Definition of organizations managing peer nodes
+# ---------------------------------------------------------------------------
+PeerOrgs:
+  # ---------------------------------------------------------------------------
+  # BankOrg
+  # ---------------------------------------------------------------------------
+  - Name: Bank
+    Domain: bank.myindo.com
+    EnableNodeOUs: true
+    Template:
+      Count: 1
+      # Start: 5 (Optional, defaults to 0)
+      # Hostname: {{.Prefix}}{{.Index}} (default)
+      # SANS:
+      #   - "{{.Hostname}}.{{.Domain}}"
+    Users:
+      Count: 1
+
+  # ---------------------------------------------------------------------------
+  # InsuranceOrg
+  # ---------------------------------------------------------------------------
+  - Name: Insurance
+    Domain: insurance.myindo.com
+    EnableNodeOUs: true
+    Template:
+      Count: 1
+    Users:
+      Count: 1
+
+  # ---------------------------------------------------------------------------
+  # HealthcareOrg
+  # ---------------------------------------------------------------------------
+  - Name: Healthcare
+    Domain: healthcare.myindo.com
+    EnableNodeOUs: true
+    Template:
+      Count: 1
+    Users:
+      Count: 1

@@ -181,7 +181,7 @@ func loadCertificate(filename string) (*x509.Certificate, error) {
 // evaluateTransaction evaluates a transaction (query)
 func evaluateTransaction(function string, args ...string) ([]byte, error) {
 	network := orgSetup.Gateway.GetNetwork("mychannel")
-	contract := network.GetContract("custom-chaincode")
+	contract := network.GetContract("basic")
 
 	return contract.EvaluateTransaction(function, args...)
 }
@@ -189,7 +189,7 @@ func evaluateTransaction(function string, args ...string) ([]byte, error) {
 // submitTransaction submits a transaction (invoke)
 func submitTransaction(function string, args ...string) ([]byte, error) {
 	network := orgSetup.Gateway.GetNetwork("mychannel")
-	contract := network.GetContract("custom-chaincode")
+	contract := network.GetContract("basic")
 
 	txn_proposal, err := contract.NewProposal(function, client.WithArguments(args...))
 	if err != nil {
